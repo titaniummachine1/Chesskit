@@ -1,5 +1,6 @@
 export enum GameOrigin {
   Pgn = "pgn",
+  Fen = "fen",
   ChessCom = "chesscom",
   Lichess = "lichess",
 }

@@ -1,5 +1,5 @@
 import { useGameDatabase } from "@/hooks/useGameDatabase";
-import { getGameFromPgn } from "@/lib/chess";
+import { getGameFromPgn, getGameFromFen } from "@/lib/chess";
 import { GameOrigin } from "@/types/enums";
 import {
   MenuItem,
@@ -20,6 +20,7 @@ import { setContext as setSentryContext } from "@sentry/react";
 import { Chess } from "chess.js";
 import { useRef, useState } from "react";
 import GamePgnInput from "./gamePgnInput";
+import GameFenInput from "./gameFenInput";
 import ChessComInput from "./chessComInput";
 import { useLocalStorage } from "@/hooks/useLocalStorage";
 import LichessInput from "./lichessInput";
@@ -34,6 +35,7 @@ interface Props {
 
 export default function NewGameDialog({ open, onClose, setGame }: Props) {
   const [pgn, setPgn] = useState("");
+  const [fen, setFen] = useState("");
   const [gameOrigin, setGameOrigin] = useLocalStorage(
     "preferred-game-origin",
     GameOrigin.ChessCom
@@ -43,12 +45,19 @@ export default function NewGameDialog({ open, onClose, setGame }: Props) {
   const setBoardOrientation = useSetAtom(boardOrientationAtom);
   const { addGame } = useGameDatabase();
 
-  const handleAddGame = async (pgn: string, boardOrientation?: boolean) => {
-    if (!pgn) return;
+  const handleAddGame = async (input: string, boardOrientation?: boolean) => {
+    if (!input) return;
 
     try {
-      const gameToAdd = getGameFromPgn(pgn);
-      setSentryContext("loadedGame", { pgn });
+      let gameToAdd: Chess;
+      
+      if (gameOrigin === GameOrigin.Fen) {
+        gameToAdd = getGameFromFen(input);
+        setSentryContext("loadedGame", { fen: input });
+      } else {
+        gameToAdd = getGameFromPgn(input);
+        setSentryContext("loadedGame", { pgn: input });
+      }
 
       if (setGame) {
         await setGame(gameToAdd);
@@ -65,10 +74,14 @@ export default function NewGameDialog({ open, onClose, setGame }: Props) {
         clearTimeout(parsingErrorTimeout.current);
       }
 
+      const errorMessage = gameOrigin === GameOrigin.Fen 
+        ? "Invalid FEN: " 
+        : "Invalid PGN: ";
+
       setParsingError(
         error instanceof Error
-          ? `${error.message} !`
-          : "Invalid PGN: unknown error !"
+          ? `${errorMessage}${error.message} !`
+          : `${errorMessage}unknown error !`
       );
 
       parsingErrorTimeout.current = setTimeout(() => {
@@ -79,6 +92,7 @@ export default function NewGameDialog({ open, onClose, setGame }: Props) {
 
   const handleClose = () => {
     setPgn("");
+    setFen("");
     setParsingError("");
     if (parsingErrorTimeout.current) {
       clearTimeout(parsingErrorTimeout.current);
@@ -137,6 +151,10 @@ export default function NewGameDialog({ open, onClose, setGame }: Props) {
             <GamePgnInput pgn={pgn} setPgn={setPgn} />
           )}
 
+          {gameOrigin === GameOrigin.Fen && (
+            <GameFenInput fen={fen} setFen={setFen} />
+          )}
+
           {gameOrigin === GameOrigin.ChessCom && (
             <ChessComInput onSelect={handleAddGame} />
           )}
@@ -172,6 +190,17 @@ export default function NewGameDialog({ open, onClose, setGame }: Props) {
             Add
           </Button>
         )}
+        {gameOrigin === GameOrigin.Fen && (
+          <Button
+            variant="contained"
+            sx={{ marginLeft: 2 }}
+            onClick={() => {
+              handleAddGame(fen);
+            }}
+          >
+            Add
+          </Button>
+        )}
       </DialogActions>
     </Dialog>
   );
@@ -181,4 +210,5 @@ const gameOriginLabel: Record<GameOrigin, string> = {
   [GameOrigin.ChessCom]: "Chess.com",
   [GameOrigin.Lichess]: "Lichess.org",
   [GameOrigin.Pgn]: "PGN",
+  [GameOrigin.Fen]: "FEN",
 };

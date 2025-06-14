@@ -25,6 +25,11 @@ export const getGameFromPgn = (pgn: string): Chess => {
   return game;
 };
 
+export const getGameFromFen = (fen: string): Chess => {
+  const game = new Chess(fen);
+  return game;
+};
+
 export const formatGameToDatabase = (game: Chess): Omit<Game, "id"> => {
   const headers: Record<string, string | undefined> = game.getHeaders();
 
