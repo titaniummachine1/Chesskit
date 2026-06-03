@@ -17,7 +17,11 @@ export const LICHESS_MAX_PIECES = 7;
 
 export type LichessTryReason = "early" | "opening" | "endgame";
 
-export type LichessCloudMissReason = "404" | "shallow" | "insufficient-pv";
+export type LichessCloudMissReason =
+  | "404"
+  | "shallow"
+  | "insufficient-pv"
+  | "timeout";
 
 export interface LichessCloudEvalResult {
   eval: PositionEval | null;
@@ -33,7 +37,7 @@ const countBoardPieces = (fen: string): number => {
 
 const getPliesPlayed = (fen: string): number => {
   const parts = fen.split(" ");
-  const fullMoveNumber = parseInt(parts[5] || "1", 10);
+  const fullMoveNumber = Number.parseInt(parts[5] || "1", 10);
   const sideToMove = parts[1] || "w";
   return (fullMoveNumber - 1) * 2 + (sideToMove === "b" ? 1 : 0);
 };
@@ -95,7 +99,7 @@ export const planAndStartLichessPrefetch = (
     }
   }
 
-  const lichessCache = new LichessPrefetchCache(fens, uciMoves);
+  const lichessCache = LichessPrefetchCache.create(fens, uciMoves);
 
   logMessageIfLocalhost(
     `[analysis #${sessionId}] Plan: ${cloudIndices.length} Lichess prefetch [${cloudIndices.join(",")}], ${wasmIndices.length} WASM [${wasmIndices.join(",")}]`
@@ -200,7 +204,6 @@ export const resolveLichessCloudEvalForGame = async (
       missReason: getLichessCloudMissReason(evalPv1, 1),
       requiredMultiPv: classificationMultiPv,
     };
-    lichessGameEvalCache.set(cacheKey, result);
     return result;
   }
 
@@ -224,6 +227,7 @@ export const resolveLichessCloudEvalForGame = async (
       eval: evalPv2,
       requiredMultiPv: LICHESS_CLASSIFICATION_MIN_PV,
     };
+    lichessGameEvalCache.set(cacheKey, result);
   } else {
     result = {
       eval: null,
@@ -235,7 +239,6 @@ export const resolveLichessCloudEvalForGame = async (
     };
   }
 
-  lichessGameEvalCache.set(cacheKey, result);
   return result;
 };
 
@@ -246,7 +249,13 @@ export class LichessPrefetchCache {
   private readonly pending = new Map<number, Promise<LichessCloudEvalResult>>();
   private readonly settled = new Map<number, LichessCloudEvalResult>();
 
-  constructor(fens: string[], uciMoves: string[]) {
+  static create(fens: string[], uciMoves: string[]): LichessPrefetchCache {
+    const cache = new LichessPrefetchCache();
+    cache.startPrefetch(fens, uciMoves);
+    return cache;
+  }
+
+  private startPrefetch(fens: string[], uciMoves: string[]) {
     for (let index = 0; index < fens.length; index++) {
       if (!shouldTryLichessCloudEval(fens[index], index)) continue;
 
@@ -261,6 +270,8 @@ export class LichessPrefetchCache {
       this.pending.set(index, promise);
     }
   }
+
+  private constructor() {}
 
   get candidateCount(): number {
     return this.pending.size;

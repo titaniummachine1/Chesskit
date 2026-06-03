@@ -7,8 +7,43 @@ import {
   LichessResponse,
 } from "@/types/lichess";
 import { logErrorToSentry } from "./sentry";
+import { logMessageIfLocalhost } from "./helpers";
 import { formatUciPv } from "./chess";
 import { LoadedGame } from "@/types/game";
+
+const LICHESS_MAX_CONCURRENT = 4;
+const LICHESS_FETCH_TIMEOUT_MS = 2500;
+
+let lichessSlotsInUse = 0;
+const lichessSlotWaiters: (() => void)[] = [];
+
+const acquireLichessSlot = (): Promise<void> => {
+  if (lichessSlotsInUse < LICHESS_MAX_CONCURRENT) {
+    lichessSlotsInUse++;
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    lichessSlotWaiters.push(() => {
+      lichessSlotsInUse++;
+      resolve();
+    });
+  });
+};
+
+const releaseLichessSlot = (): void => {
+  lichessSlotsInUse--;
+  lichessSlotWaiters.shift()?.();
+};
+
+const withLichessSlot = async <T>(fn: () => Promise<T>): Promise<T> => {
+  await acquireLichessSlot();
+  try {
+    return await fn();
+  } finally {
+    releaseLichessSlot();
+  }
+};
 
 export const getLichessEval = async (
   fen: string,
@@ -82,25 +117,47 @@ const fetchLichessEval = async (
   fen: string,
   multiPv: number
 ): Promise<LichessResponse<LichessEvalBody>> => {
-  try {
-    const res = await fetch(
-      `https://lichess.org/api/cloud-eval?fen=${fen}&multiPv=${multiPv}`,
-      { method: "GET", signal: AbortSignal.timeout(500) }
-    );
+  return withLichessSlot(async () => {
+    try {
+      const url = `https://lichess.org/api/cloud-eval?fen=${encodeURIComponent(fen)}&multiPv=${multiPv}`;
+      const res = await fetch(url, {
+        method: "GET",
+        signal: AbortSignal.timeout(LICHESS_FETCH_TIMEOUT_MS),
+      });
 
-    const json = await res.json();
-    return json;
-  } catch (error) {
-    const isTimeoutError =
-      error instanceof Error && error.name === "TimeoutError";
-    const isAbortError = error instanceof Error && error.name === "AbortError";
+      if (res.status === 404) {
+        logMessageIfLocalhost(
+          `Lichess cloud-eval 404 (not in database): ${fen.split(" ")[0]}`
+        );
+        return { error: LichessError.NotFound };
+      }
 
-    if (!isTimeoutError && !isAbortError) {
-      console.error(error);
+      if (!res.ok) {
+        logMessageIfLocalhost(
+          `Lichess cloud-eval HTTP ${res.status}: ${fen.split(" ")[0]}`
+        );
+        return { error: LichessError.NotFound };
+      }
+
+      const json = (await res.json()) as LichessResponse<LichessEvalBody>;
+      return json;
+    } catch (error) {
+      const isTimeoutError =
+        error instanceof Error && error.name === "TimeoutError";
+      const isAbortError =
+        error instanceof Error && error.name === "AbortError";
+
+      if (isTimeoutError || isAbortError) {
+        logMessageIfLocalhost(
+          `Lichess cloud-eval timeout (${LICHESS_FETCH_TIMEOUT_MS}ms): ${fen.split(" ")[0]}`
+        );
+      } else if (!isAbortError) {
+        console.error(error);
+      }
+
+      return { error: LichessError.NotFound };
     }
-
-    return { error: LichessError.NotFound };
-  }
+  });
 };
 
 export const fetchLichessGame = async (

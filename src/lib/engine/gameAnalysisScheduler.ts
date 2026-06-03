@@ -21,7 +21,6 @@ interface AnalysisLane {
   pendingIndices: number[];
   currentIndex: number | null;
   completedCount: number;
-  retired?: boolean;
 }
 
 export interface RunGameAnalysisParams {
@@ -33,7 +32,6 @@ export interface RunGameAnalysisParams {
   progressTracker: AnalysisProgressTracker;
   isSessionActive: () => boolean;
   onPositionComplete: (index: number, positionEval: PositionEval) => void;
-  onReleaseWorker?: (worker: EngineWorker) => void;
 }
 
 class AnalysisLogger {
@@ -156,69 +154,6 @@ const getStealCount = (pendingCount: number): number => {
   return Math.ceil(pendingCount / 2);
 };
 
-const isLaneBusy = (
-  lane: AnalysisLane,
-  isIndexDone: (index: number) => boolean
-): boolean => {
-  if (lane.retired) return false;
-
-  if (lane.currentIndex !== null && !isIndexDone(lane.currentIndex)) {
-    return true;
-  }
-
-  return lane.pendingIndices.some((index) => !isIndexDone(index));
-};
-
-const countActiveLanes = (lanes: AnalysisLane[]): number => {
-  return lanes.filter((lane) => !lane.retired).length;
-};
-
-const countUndoneWasmIndices = (
-  lanes: AnalysisLane[],
-  isIndexDone: (index: number) => boolean
-): number => {
-  const undone = new Set<number>();
-
-  for (const lane of lanes) {
-    if (lane.retired) continue;
-
-    for (const index of lane.pendingIndices) {
-      if (!isIndexDone(index)) undone.add(index);
-    }
-
-    if (lane.currentIndex !== null && !isIndexDone(lane.currentIndex)) {
-      undone.add(lane.currentIndex);
-    }
-  }
-
-  return undone.size;
-};
-
-const tryRetireIdleLane = (
-  lane: AnalysisLane,
-  lanes: AnalysisLane[],
-  lichessCache: LichessPrefetchCache,
-  isIndexDone: (index: number) => boolean,
-  onReleaseWorker: ((worker: EngineWorker) => void) | undefined,
-  logger: AnalysisLogger
-): boolean => {
-  if (lane.retired || isLaneBusy(lane, isIndexDone)) return false;
-  if (!lichessCache.isAllSettled()) return false;
-  if (!onReleaseWorker) return false;
-
-  const activeLanes = countActiveLanes(lanes);
-  const undoneWasm = countUndoneWasmIndices(lanes, isIndexDone);
-
-  if (activeLanes <= 1 || undoneWasm >= activeLanes) return false;
-
-  lane.retired = true;
-  onReleaseWorker(lane.worker);
-  logger.log(
-    `Lane ${lane.id} retired (${activeLanes - 1} workers left, ${undoneWasm} WASM ply(s) pending)`
-  );
-  return true;
-};
-
 const findBusiestPeer = (
   lanes: AnalysisLane[],
   idleLaneId: number,
@@ -229,7 +164,7 @@ const findBusiestPeer = (
   let maxWorkWeight = 0;
 
   for (const lane of lanes) {
-    if (lane.id === idleLaneId || lane.retired) continue;
+    if (lane.id === idleLaneId) continue;
 
     const undonePending = lane.pendingIndices.filter(
       (index) => !isIndexDone(index)
@@ -257,8 +192,6 @@ const tryStealFromBusiestPeer = (
   isIndexDone: (index: number) => boolean,
   logger: AnalysisLogger
 ): boolean => {
-  if (idleLane.retired) return false;
-
   const victim = findBusiestPeer(
     lanes,
     idleLane.id,
@@ -306,23 +239,22 @@ const injectLocalWork = (
   positionWeights: number[],
   logger: AnalysisLogger
 ): void => {
-  const activeLanes = lanes.filter((lane) => !lane.retired);
-  if (activeLanes.length === 0) return;
+  if (lanes.length === 0) return;
 
-  for (const lane of activeLanes) {
+  for (const lane of lanes) {
     if (lane.pendingIndices.includes(index) || lane.currentIndex === index) {
       return;
     }
   }
 
-  let lightestLane = activeLanes[0];
+  let lightestLane = lanes[0];
   let lightestWork = getPendingWorkWeight(
     lightestLane.pendingIndices,
     positionWeights
   );
 
-  for (let laneId = 1; laneId < activeLanes.length; laneId++) {
-    const lane = activeLanes[laneId];
+  for (let laneId = 1; laneId < lanes.length; laneId++) {
+    const lane = lanes[laneId];
     const work = getPendingWorkWeight(lane.pendingIndices, positionWeights);
     if (work < lightestWork) {
       lightestWork = work;
@@ -365,50 +297,68 @@ const takeNextPendingIndex = (
 
 const LICHESS_COORDINATOR_LANE = -1;
 
+interface GameAnalysisRunContext {
+  lanes: AnalysisLane[];
+  fens: string[];
+  depth: number;
+  positionWeights: number[];
+  coordinator: WorkCoordinator;
+  progressTracker: AnalysisProgressTracker;
+  logger: AnalysisLogger;
+  lichessCache: LichessPrefetchCache;
+  isSessionActive: () => boolean;
+  isIndexDone: (index: number) => boolean;
+  onPositionComplete: (index: number, positionEval: PositionEval) => void;
+  getCompleted: () => number;
+  isGlobalComplete: () => boolean;
+}
+
+const handleCloudPrefetchResult = (
+  index: number,
+  result: NonNullable<Awaited<ReturnType<LichessPrefetchCache["awaitResult"]>>>,
+  ctx: GameAnalysisRunContext
+): void => {
+  if (result.eval) {
+    if (ctx.isIndexDone(index)) return;
+
+    const lichessReason = getLichessTryReason(ctx.fens[index], index);
+    const cloudDepth = result.eval.lines[0].depth ?? ctx.depth;
+    logMessageIfLocalhost(
+      `Lichess cloud hit pos #${index} (${lichessReason}, depth ${cloudDepth}, pv ${result.eval.lines.length}/${result.requiredMultiPv})`
+    );
+    removeIndexFromLaneQueues(ctx.lanes, index);
+    ctx.progressTracker.setLaneDepth(
+      LICHESS_COORDINATOR_LANE,
+      index,
+      ctx.depth
+    );
+    ctx.progressTracker.markComplete(index, LICHESS_COORDINATOR_LANE);
+    ctx.onPositionComplete(index, result.eval);
+    return;
+  }
+
+  const lichessReason = getLichessTryReason(ctx.fens[index], index);
+  logMessageIfLocalhost(
+    `Lichess cloud ${result.missReason} pos #${index} (${lichessReason}, need pv ${result.requiredMultiPv})`
+  );
+  if (!ctx.isIndexDone(index)) {
+    injectLocalWork(ctx.lanes, index, ctx.positionWeights, ctx.logger);
+  }
+};
+
 const runCloudCoordinator = async (
-  lichessCache: LichessPrefetchCache,
-  lanes: AnalysisLane[],
-  fens: string[],
-  depth: number,
-  positionWeights: number[],
-  coordinator: WorkCoordinator,
-  progressTracker: AnalysisProgressTracker,
-  logger: AnalysisLogger,
-  isSessionActive: () => boolean,
-  isIndexDone: (index: number) => boolean,
-  onPositionComplete: (index: number, positionEval: PositionEval) => void
+  ctx: GameAnalysisRunContext
 ): Promise<void> => {
-  const candidates = lichessCache.getCandidateIndices();
+  const candidates = ctx.lichessCache.getCandidateIndices();
   if (candidates.length === 0) return;
 
   await Promise.all(
     candidates.map(async (index) => {
-      const result = await lichessCache.awaitResult(index);
-      if (!isSessionActive() || !result) return;
+      const result = await ctx.lichessCache.awaitResult(index);
+      if (!ctx.isSessionActive() || !result) return;
 
-      if (result.eval) {
-        if (isIndexDone(index)) return;
-
-        const lichessReason = getLichessTryReason(fens[index], index);
-        const cloudDepth = result.eval.lines[0].depth ?? depth;
-        logMessageIfLocalhost(
-          `Lichess cloud hit pos #${index} (${lichessReason}, depth ${cloudDepth}, pv ${result.eval.lines.length}/${result.requiredMultiPv})`
-        );
-        removeIndexFromLaneQueues(lanes, index);
-        progressTracker.setLaneDepth(LICHESS_COORDINATOR_LANE, index, depth);
-        progressTracker.markComplete(index, LICHESS_COORDINATOR_LANE);
-        onPositionComplete(index, result.eval);
-      } else {
-        const lichessReason = getLichessTryReason(fens[index], index);
-        logMessageIfLocalhost(
-          `Lichess cloud ${result.missReason} pos #${index} (${lichessReason}, need pv ${result.requiredMultiPv})`
-        );
-        if (!isIndexDone(index)) {
-          injectLocalWork(lanes, index, positionWeights, logger);
-        }
-      }
-
-      coordinator.notifyWorkAvailable();
+      handleCloudPrefetchResult(index, result, ctx);
+      ctx.coordinator.notifyWorkAvailable();
     })
   );
 };
@@ -430,7 +380,7 @@ const evaluatePosition = async (
     const depthValue = getResultProperty(message, "depth");
     if (!depthValue) return;
 
-    const parsedDepth = parseInt(depthValue, 10);
+    const parsedDepth = Number.parseInt(depthValue, 10);
     if (parsedDepth > depthReached) {
       depthReached = parsedDepth;
       progressTracker.setLaneDepth(laneId, index, depthReached);
@@ -456,61 +406,65 @@ const evaluatePosition = async (
   };
 };
 
-const runLane = async (
+const waitForLaneWork = async (
   lane: AnalysisLane,
-  lanes: AnalysisLane[],
-  coordinator: WorkCoordinator,
-  lichessCache: LichessPrefetchCache,
-  logger: AnalysisLogger,
-  fens: string[],
-  depth: number,
-  positionWeights: number[],
-  progressTracker: AnalysisProgressTracker,
-  isSessionActive: () => boolean,
-  isIndexDone: (index: number) => boolean,
-  onPositionComplete: (index: number, positionEval: PositionEval) => void,
-  onReleaseWorker: ((worker: EngineWorker) => void) | undefined,
-  getCompleted: () => number,
-  isGlobalComplete: () => boolean
-) => {
-  while (!lane.retired && !isGlobalComplete() && isSessionActive()) {
+  ctx: GameAnalysisRunContext
+): Promise<boolean> => {
+  if (
+    tryStealFromBusiestPeer(
+      ctx.lanes,
+      lane,
+      ctx.positionWeights,
+      ctx.isIndexDone,
+      ctx.logger
+    )
+  ) {
+    ctx.coordinator.notifyWorkAvailable();
+    return true;
+  }
+
+  if (ctx.isGlobalComplete() || !ctx.isSessionActive()) return false;
+
+  await ctx.coordinator.waitForWork();
+  return true;
+};
+
+const finishLanePosition = (
+  lane: AnalysisLane,
+  index: number,
+  positionEval: PositionEval,
+  depthReached: number,
+  positionMs: number,
+  ctx: GameAnalysisRunContext
+): void => {
+  ctx.progressTracker.markComplete(index, lane.id);
+  ctx.onPositionComplete(index, positionEval);
+  lane.currentIndex = null;
+  lane.completedCount++;
+
+  ctx.logger.logPositionDone(
+    lane.id,
+    index,
+    positionMs,
+    depthReached,
+    ctx.getCompleted(),
+    ctx.fens.length,
+    ctx.progressTracker.getProgress()
+  );
+  ctx.coordinator.notifyWorkAvailable();
+};
+
+const runLane = async (lane: AnalysisLane, ctx: GameAnalysisRunContext) => {
+  while (!ctx.isGlobalComplete() && ctx.isSessionActive()) {
     if (lane.pendingIndices.length === 0) {
-      if (
-        tryStealFromBusiestPeer(
-          lanes,
-          lane,
-          positionWeights,
-          isIndexDone,
-          logger
-        )
-      ) {
-        coordinator.notifyWorkAvailable();
-        continue;
-      }
-
-      if (isGlobalComplete() || !isSessionActive()) break;
-
-      if (
-        tryRetireIdleLane(
-          lane,
-          lanes,
-          lichessCache,
-          isIndexDone,
-          onReleaseWorker,
-          logger
-        )
-      ) {
-        coordinator.notifyWorkAvailable();
-        break;
-      }
-
-      await coordinator.waitForWork();
+      const shouldContinue = await waitForLaneWork(lane, ctx);
+      if (!shouldContinue) break;
       continue;
     }
 
-    if (!isSessionActive()) break;
+    if (!ctx.isSessionActive()) break;
 
-    const index = takeNextPendingIndex(lane, isIndexDone);
+    const index = takeNextPendingIndex(lane, ctx.isIndexDone);
     if (index === undefined) continue;
 
     lane.currentIndex = index;
@@ -518,38 +472,30 @@ const runLane = async (
     const positionStartedAt = performance.now();
     const { eval: positionEval, depthReached } = await evaluatePosition(
       lane.worker,
-      fens[index],
-      depth,
+      ctx.fens[index],
+      ctx.depth,
       lane.id,
       index,
-      progressTracker
+      ctx.progressTracker
     );
     const positionMs = performance.now() - positionStartedAt;
 
-    if (!isSessionActive()) break;
+    if (!ctx.isSessionActive()) break;
 
-    if (isIndexDone(index)) {
+    if (ctx.isIndexDone(index)) {
       lane.currentIndex = null;
-      coordinator.notifyWorkAvailable();
+      ctx.coordinator.notifyWorkAvailable();
       continue;
     }
 
-    progressTracker.markComplete(index, lane.id);
-    onPositionComplete(index, positionEval);
-
-    lane.currentIndex = null;
-    lane.completedCount++;
-
-    logger.logPositionDone(
-      lane.id,
+    finishLanePosition(
+      lane,
       index,
-      positionMs,
+      positionEval,
       depthReached,
-      getCompleted(),
-      fens.length,
-      progressTracker.getProgress()
+      positionMs,
+      ctx
     );
-    coordinator.notifyWorkAvailable();
   }
 };
 
@@ -562,7 +508,6 @@ export const runGameAnalysis = async ({
   progressTracker,
   isSessionActive,
   onPositionComplete,
-  onReleaseWorker,
 }: RunGameAnalysisParams): Promise<void> => {
   const logger = new AnalysisLogger(sessionId);
   let completed = 0;
@@ -629,50 +574,34 @@ export const runGameAnalysis = async ({
   const isGlobalComplete = () => completed >= fens.length;
   const isIndexDone = (index: number) => finishedIndices.has(index);
 
+  const runContext: GameAnalysisRunContext = {
+    lanes,
+    fens,
+    depth,
+    positionWeights,
+    coordinator,
+    progressTracker,
+    logger,
+    lichessCache,
+    isSessionActive,
+    isIndexDone,
+    onPositionComplete: wrappedOnComplete,
+    getCompleted: () => completed,
+    isGlobalComplete,
+  };
+
   await Promise.all([
-    runCloudCoordinator(
-      lichessCache,
-      lanes,
-      fens,
-      depth,
-      positionWeights,
-      coordinator,
-      progressTracker,
-      logger,
-      isSessionActive,
-      isIndexDone,
-      wrappedOnComplete
-    ),
-    ...lanes.map((lane) =>
-      runLane(
-        lane,
-        lanes,
-        coordinator,
-        lichessCache,
-        logger,
-        fens,
-        depth,
-        positionWeights,
-        progressTracker,
-        isSessionActive,
-        isIndexDone,
-        wrappedOnComplete,
-        onReleaseWorker,
-        () => completed,
-        isGlobalComplete
-      )
-    ),
+    runCloudCoordinator(runContext),
+    ...lanes.map((lane) => runLane(lane, runContext)),
   ]);
 
   if (isSessionActive()) {
-    const activeLanes = countActiveLanes(lanes);
-    logger.logFinished(completed, activeLanes);
+    logger.logFinished(completed, lanes.length);
   } else {
     logger.log("Aborted (superseded by newer analysis session)");
   }
 
-  for (const lane of lanes) {
-    if (lane.retired) continue;
-    lane.worker.isReady = true;
+  for (const worker of workers.slice(0, lanes.length)) {
+    worker.isReady = true;
   }
 };

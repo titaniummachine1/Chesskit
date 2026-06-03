@@ -38,10 +38,10 @@ export class UciEngine {
   private workers: EngineWorker[] = [];
   private workerQueue: WorkerJob[] = [];
   private isReady = false;
-  private enginePath: string;
-  private customEngineInit?:
+  private readonly enginePath: string;
+  private readonly customEngineInit:
     | ((worker: EngineWorker) => Promise<void>)
-    | undefined = undefined;
+    | undefined;
   private multiPv = 3;
   private elo: number | undefined = undefined;
   private gameAnalysisActive = false;
@@ -373,12 +373,6 @@ export class UciEngine {
         progressTracker,
         isSessionActive: () => isGameAnalysisSessionActive(sessionId),
         onPositionComplete: updateEval,
-        onReleaseWorker: (worker) => {
-          const workerIndex = this.workers.indexOf(worker);
-          if (workerIndex === -1) return;
-          this.workers.splice(workerIndex, 1);
-          this.terminateWorker(worker);
-        },
       });
 
       if (!isGameAnalysisSessionActive(sessionId)) {
