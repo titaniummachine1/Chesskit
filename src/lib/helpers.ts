@@ -23,3 +23,8 @@ export const logMessageIfLocalhost = (message: string) => {
 
   console.log(message);
 };
+
+export const formatElapsedMs = (ms: number): string => {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+};

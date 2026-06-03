@@ -39,6 +39,7 @@ const LinearProgressBar = (
             [`& .${linearProgressClasses.bar}`]: {
               borderRadius: 5,
               backgroundColor: LINEAR_PROGRESS_BAR_COLOR,
+              transition: "transform 0.08s linear",
             },
           })}
         />

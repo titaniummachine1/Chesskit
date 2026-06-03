@@ -60,7 +60,7 @@ export interface EvaluateGameParams {
   uciMoves: string[];
   depth?: number;
   multiPv?: number;
-  setEvaluationProgress?: (value: number) => void;
+  setEvaluationProgress?: (value: number | ((prev: number) => number)) => void;
   playersRatings?: { white?: number; black?: number };
   workersNb?: number;
 }

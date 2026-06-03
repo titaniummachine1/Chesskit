@@ -10,13 +10,28 @@ import {
   parseEvaluationResults,
 } from "./helpers/parseResults";
 import { computeAccuracy } from "./helpers/accuracy";
-import { getIsStalemate, getWhoIsCheckmated } from "../chess";
-import { getLichessEval } from "../lichess";
 import { getMovesClassification } from "./helpers/moveClassification";
 import { computeEstimatedElo } from "./helpers/estimateElo";
 import { EngineWorker, WorkerJob } from "@/types/engine";
 import { getEngineWorker, sendCommandsToWorker } from "./worker";
 import { logMessageIfLocalhost } from "../helpers";
+import {
+  countEnginePositions,
+  getEffectiveWorkersNb,
+  runGameAnalysis,
+} from "./gameAnalysisScheduler";
+import {
+  planAndStartLichessPrefetch,
+  resolveLichessCloudEvalForLive,
+  shouldTryLichessCloudEval,
+} from "./lichessCloudEval";
+import { AnalysisProgressTracker } from "./analysisProgressTracker";
+import {
+  beginGameAnalysisSession,
+  cancelGameAnalysisSession,
+  isGameAnalysisSessionActive,
+  isUiAnalysisLocked,
+} from "./gameAnalysisLock";
 
 export class UciEngine {
   public readonly name: EngineName;
@@ -29,6 +44,7 @@ export class UciEngine {
     | undefined = undefined;
   private multiPv = 3;
   private elo: number | undefined = undefined;
+  private gameAnalysisActive = false;
 
   private constructor(
     engineName: EngineName,
@@ -54,8 +70,10 @@ export class UciEngine {
   }
 
   private acquireWorker(): EngineWorker | undefined {
+    if (isUiAnalysisLocked()) return undefined;
+
     for (const worker of this.workers) {
-      if (!worker.isReady) continue;
+      if (worker.inGameAnalysis || !worker.isReady) continue;
 
       worker.isReady = false;
       return worker;
@@ -128,7 +146,10 @@ export class UciEngine {
   }
 
   public shutdown(): void {
+    if (isUiAnalysisLocked()) return;
+
     this.isReady = false;
+    cancelGameAnalysisSession();
     this.workerQueue = [];
 
     for (const worker of this.workers) {
@@ -144,21 +165,49 @@ export class UciEngine {
     worker.terminate();
   }
 
+  private throwIfAnalysisInProgress(): void {
+    if (isUiAnalysisLocked()) {
+      throw new Error("Game analysis in progress");
+    }
+  }
+
+  private setWorkersInGameAnalysis(inAnalysis: boolean): void {
+    this.gameAnalysisActive = inAnalysis;
+    for (const worker of this.workers) {
+      worker.inGameAnalysis = inAnalysis;
+    }
+  }
+
   public async stopAllCurrentJobs(): Promise<void> {
+    if (isUiAnalysisLocked()) return;
+
     const abandonedJobs = [...this.workerQueue];
     this.workerQueue = [];
 
     for (const worker of this.workers) {
+      if (worker.inGameAnalysis) continue;
       worker.listen = () => null;
+    }
+
+    const poolWorkers = this.workers.filter((worker) => !worker.inGameAnalysis);
+    if (poolWorkers.length === 0) {
+      for (const job of abandonedJobs) {
+        job.resolve([]);
+      }
+      return;
     }
 
     for (const job of abandonedJobs) {
       job.resolve([]);
     }
 
-    await this.sendCommandsToEachWorker(["stop", "isready"], "readyok");
+    await Promise.all(
+      poolWorkers.map((worker) =>
+        sendCommandsToWorker(worker, ["stop", "isready"], "readyok")
+      )
+    );
 
-    for (const worker of this.workers) {
+    for (const worker of poolWorkers) {
       this.releaseWorker(worker);
     }
   }
@@ -222,6 +271,7 @@ export class UciEngine {
     await this.customEngineInit?.(worker);
     await sendCommandsToWorker(worker, ["ucinewgame", "isready"], "readyok");
 
+    worker.inGameAnalysis = this.gameAnalysisActive;
     this.workers.push(worker);
     this.releaseWorker(worker);
   }
@@ -263,97 +313,115 @@ export class UciEngine {
   }: EvaluateGameParams): Promise<GameEval> {
     this.throwErrorIfNotReady();
     this.isReady = false;
-    setEvaluationProgress?.(1);
+    this.setWorkersInGameAnalysis(true);
 
-    await this.setMultiPv(multiPv);
-    await this.sendCommandsToEachWorker(["ucinewgame", "isready"], "readyok");
-    this.setWorkersNb(workersNb);
+    const sessionId = beginGameAnalysisSession();
 
-    const positions: PositionEval[] = new Array(fens.length);
-    let completed = 0;
-
-    const updateEval = (index: number, positionEval: PositionEval) => {
-      completed++;
-      positions[index] = positionEval;
-      const progress = completed / fens.length;
-      setEvaluationProgress?.(99 - Math.exp(-4 * progress) * 99);
-    };
-
-    await Promise.all(
-      fens.map(async (fen, i) => {
-        const whoIsCheckmated = getWhoIsCheckmated(fen);
-        if (whoIsCheckmated) {
-          updateEval(i, {
-            lines: [
-              {
-                pv: [],
-                depth: 0,
-                multiPv: 1,
-                mate: whoIsCheckmated === "w" ? -1 : 1,
-              },
-            ],
-          });
-          return;
-        }
-
-        const isStalemate = getIsStalemate(fen);
-        if (isStalemate) {
-          updateEval(i, {
-            lines: [
-              {
-                pv: [],
-                depth: 0,
-                multiPv: 1,
-                cp: 0,
-              },
-            ],
-          });
-          return;
-        }
-
-        const result = await this.evaluatePosition(fen, depth);
-        updateEval(i, result);
-      })
+    const enginePositionCount = countEnginePositions(fens);
+    const effectiveWorkersNb = getEffectiveWorkersNb(
+      workersNb,
+      enginePositionCount
     );
 
-    await this.setWorkersNb(1);
-    this.isReady = true;
+    logMessageIfLocalhost(
+      `[analysis #${sessionId}] Using ${effectiveWorkersNb} worker(s) for ${enginePositionCount} positions (requested ${workersNb}), depth ${depth}`
+    );
 
-    const positionsWithClassification = getMovesClassification(
-      positions,
+    const progressTracker = new AnalysisProgressTracker(
+      fens.length,
+      depth,
+      (value) => {
+        if (!isGameAnalysisSessionActive(sessionId)) return;
+        setEvaluationProgress?.((prev = 0) => Math.max(prev, value));
+      }
+    );
+
+    progressTracker.setPhaseProgress(1);
+
+    const { lichessCache } = planAndStartLichessPrefetch(
+      fens,
       uciMoves,
-      fens
-    );
-    const accuracy = computeAccuracy(positions);
-    const estimatedElo = computeEstimatedElo(
-      positions,
-      playersRatings?.white,
-      playersRatings?.black
+      sessionId
     );
 
-    return {
-      positions: positionsWithClassification,
-      estimatedElo,
-      accuracy,
-      settings: {
-        engine: this.name,
-        date: new Date().toISOString(),
+    try {
+      await this.setMultiPv(multiPv);
+      if (!isGameAnalysisSessionActive(sessionId)) {
+        throw new Error("Analysis superseded");
+      }
+
+      await this.setWorkersNb(effectiveWorkersNb);
+      if (!isGameAnalysisSessionActive(sessionId)) {
+        throw new Error("Analysis superseded");
+      }
+
+      await this.sendCommandsToEachWorker(["ucinewgame", "isready"], "readyok");
+
+      const positions: PositionEval[] = new Array(fens.length);
+
+      const updateEval = (index: number, positionEval: PositionEval) => {
+        if (!isGameAnalysisSessionActive(sessionId)) return;
+        positions[index] = positionEval;
+      };
+
+      await runGameAnalysis({
+        workers: this.workers,
+        fens,
         depth,
-        multiPv,
-      },
-    };
-  }
+        sessionId,
+        lichessCache,
+        progressTracker,
+        isSessionActive: () => isGameAnalysisSessionActive(sessionId),
+        onPositionComplete: updateEval,
+        onReleaseWorker: (worker) => {
+          const workerIndex = this.workers.indexOf(worker);
+          if (workerIndex === -1) return;
+          this.workers.splice(workerIndex, 1);
+          this.terminateWorker(worker);
+        },
+      });
 
-  private async evaluatePosition(
-    fen: string,
-    depth = 16
-  ): Promise<PositionEval> {
-    const results = await this.sendCommands(
-      [`position fen ${fen}`, `go depth ${depth}`],
-      "bestmove"
-    );
+      if (!isGameAnalysisSessionActive(sessionId)) {
+        throw new Error("Analysis superseded");
+      }
 
-    return parseEvaluationResults(results, fen);
+      await this.setWorkersNb(1);
+
+      progressTracker.setPhaseProgress(
+        AnalysisProgressTracker.ENGINE_PHASE_MAX
+      );
+
+      const positionsWithClassification = getMovesClassification(
+        positions,
+        uciMoves,
+        fens
+      );
+      const accuracy = computeAccuracy(positions);
+      const estimatedElo = computeEstimatedElo(
+        positions,
+        playersRatings?.white,
+        playersRatings?.black
+      );
+
+      progressTracker.setPhaseProgress(100);
+
+      return {
+        positions: positionsWithClassification,
+        estimatedElo,
+        accuracy,
+        settings: {
+          engine: this.name,
+          date: new Date().toISOString(),
+          depth,
+          multiPv,
+        },
+      };
+    } finally {
+      this.setWorkersInGameAnalysis(false);
+      if (isGameAnalysisSessionActive(sessionId)) {
+        this.isReady = true;
+      }
+    }
   }
 
   public async evaluatePositionWithUpdate({
@@ -363,11 +431,13 @@ export class UciEngine {
     setPartialEval,
   }: EvaluatePositionWithUpdateParams): Promise<PositionEval> {
     this.throwErrorIfNotReady();
-
-    const lichessEvalPromise = getLichessEval(fen, multiPv);
+    this.throwIfAnalysisInProgress();
 
     await this.stopAllCurrentJobs();
+    this.throwIfAnalysisInProgress();
+
     await this.setMultiPv(multiPv);
+    this.throwIfAnalysisInProgress();
 
     let lastUpdate = 0;
     const THROTTLE_MS = 60; // Limit UI updates to ~16 updates per second to avoid performance issues
@@ -385,14 +455,30 @@ export class UciEngine {
 
     logMessageIfLocalhost(`Evaluating position: ${fen}`);
 
-    const lichessEval = await lichessEvalPromise;
-    if (
-      lichessEval.lines.length >= multiPv &&
-      lichessEval.lines[0].depth >= depth
-    ) {
-      setPartialEval?.(lichessEval);
-      return lichessEval;
+    if (shouldTryLichessCloudEval(fen)) {
+      const {
+        eval: lichessEval,
+        missReason,
+        partialMultiPv,
+        requiredMultiPv,
+      } = await resolveLichessCloudEvalForLive(fen, multiPv);
+      this.throwIfAnalysisInProgress();
+      if (lichessEval) {
+        if (partialMultiPv) {
+          logMessageIfLocalhost(
+            `Lichess cloud hit for live eval (pv ${lichessEval.lines.length}, need ${requiredMultiPv})`
+          );
+        }
+        setPartialEval?.(lichessEval);
+        return lichessEval;
+      }
+
+      logMessageIfLocalhost(
+        `Lichess cloud ${missReason} for live eval, using local engine`
+      );
     }
+
+    this.throwIfAnalysisInProgress();
 
     const results = await this.sendCommands(
       [`position fen ${fen}`, `go depth ${depth}`],

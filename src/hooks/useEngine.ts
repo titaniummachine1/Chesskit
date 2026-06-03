@@ -6,6 +6,10 @@ import { Stockfish17 } from "@/lib/engine/stockfish17";
 import { Stockfish17_1 } from "@/lib/engine/stockfish17_1";
 import { Stockfish18 } from "@/lib/engine/stockfish18";
 import { UciEngine } from "@/lib/engine/uciEngine";
+import {
+  isUiAnalysisLocked,
+  runAfterAnalysisUnlock,
+} from "@/lib/engine/gameAnalysisLock";
 import { EngineName } from "@/types/enums";
 import { useEffect, useState } from "react";
 
@@ -20,17 +24,33 @@ export const useEngine = (engineName: EngineName | undefined) => {
       return;
     }
 
-    pickEngine(engineName).then((newEngine) => {
-      if (!isMounted) {
-        newEngine.shutdown();
-        return;
-      }
+    const loadEngine = () => {
+      pickEngine(engineName).then((newEngine) => {
+        if (!isMounted) {
+          newEngine.shutdown();
+          return;
+        }
 
-      setEngine((prev) => {
-        prev?.shutdown();
-        return newEngine;
+        setEngine((prev) => {
+          if (prev && isUiAnalysisLocked()) {
+            newEngine.shutdown();
+            return prev;
+          }
+
+          prev?.shutdown();
+          return newEngine;
+        });
       });
-    });
+    };
+
+    if (isUiAnalysisLocked()) {
+      runAfterAnalysisUnlock(loadEngine);
+      return () => {
+        isMounted = false;
+      };
+    }
+
+    loadEngine();
 
     return () => {
       isMounted = false;

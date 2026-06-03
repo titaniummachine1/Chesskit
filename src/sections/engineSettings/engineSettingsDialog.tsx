@@ -23,7 +23,6 @@ import {
   engineWorkersNbAtom,
 } from "../analysis/states";
 import ArrowOptions from "./arrowOptions";
-import { useAtomLocalStorage } from "@/hooks/useAtomLocalStorage";
 import { useEffect } from "react";
 import { isEngineSupported } from "@/lib/engine/shared";
 import { Stockfish16_1 } from "@/lib/engine/stockfish16_1";
@@ -44,18 +43,9 @@ interface Props {
 }
 
 export default function EngineSettingsDialog({ open, onClose }: Props) {
-  const [depth, setDepth] = useAtomLocalStorage(
-    "engine-depth",
-    engineDepthAtom
-  );
-  const [multiPv, setMultiPv] = useAtomLocalStorage(
-    "engine-multi-pv",
-    engineMultiPvAtom
-  );
-  const [engineName, setEngineName] = useAtomLocalStorage(
-    "engine-name",
-    engineNameAtom
-  );
+  const [depth, setDepth] = useAtom(engineDepthAtom);
+  const [multiPv, setMultiPv] = useAtom(engineMultiPvAtom);
+  const [engineName, setEngineName] = useAtom(engineNameAtom);
   const [boardHue, setBoardHue] = useAtom(boardHueAtom);
   const [pieceSet, setPieceSet] = useAtom(pieceSetAtom);
   const [engineWorkersNb, setEngineWorkersNb] = useAtom(engineWorkersNbAtom);

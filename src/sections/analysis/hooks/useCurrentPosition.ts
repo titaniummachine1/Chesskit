@@ -6,6 +6,7 @@ import {
   gameAtom,
   gameEvalAtom,
   savedEvalsAtom,
+  evaluationProgressAtom,
 } from "@/sections/analysis/states";
 import { CurrentPosition, PositionEval } from "@/types/eval";
 import { useAtom, useAtomValue } from "jotai";
@@ -13,6 +14,7 @@ import { useEffect } from "react";
 import { getEvaluateGameParams } from "@/lib/chess";
 import { getMovesClassification } from "@/lib/engine/helpers/moveClassification";
 import { openings } from "@/data/openings";
+import { isUiAnalysisLocked } from "@/lib/engine/gameAnalysisLock";
 import { UciEngine } from "@/lib/engine/uciEngine";
 
 export const useCurrentPosition = (engine: UciEngine | null) => {
@@ -23,8 +25,10 @@ export const useCurrentPosition = (engine: UciEngine | null) => {
   const depth = useAtomValue(engineDepthAtom);
   const multiPv = useAtomValue(engineMultiPvAtom);
   const [savedEvals, setSavedEvals] = useAtom(savedEvalsAtom);
+  const evaluationProgress = useAtomValue(evaluationProgressAtom);
 
   useEffect(() => {
+    let cancelled = false;
     const boardHistory = board.history({ verbose: true });
     const position: CurrentPosition = {
       lastMove: boardHistory.at(-1),
@@ -75,6 +79,8 @@ export const useCurrentPosition = (engine: UciEngine | null) => {
     if (
       !position.eval &&
       engine?.getIsReady() &&
+      !evaluationProgress &&
+      !isUiAnalysisLocked() &&
       engine.name &&
       !board.isCheckmate() &&
       !board.isStalemate()
@@ -83,7 +89,12 @@ export const useCurrentPosition = (engine: UciEngine | null) => {
         fen: string,
         setPartialEval?: (positionEval: PositionEval) => void
       ) => {
-        if (!engine.getIsReady()) {
+        if (
+          cancelled ||
+          isUiAnalysisLocked() ||
+          evaluationProgress ||
+          !engine.getIsReady()
+        ) {
           throw new Error("Engine not ready");
         }
         const savedEval = savedEvals[fen];
@@ -108,6 +119,10 @@ export const useCurrentPosition = (engine: UciEngine | null) => {
           setPartialEval,
         });
 
+        if (cancelled || isUiAnalysisLocked()) {
+          throw new Error("Engine not ready");
+        }
+
         setSavedEvals((prev) => ({
           ...prev,
           [fen]: { ...rawPositionEval, engine: engine.name },
@@ -118,6 +133,7 @@ export const useCurrentPosition = (engine: UciEngine | null) => {
 
       const getPositionEval = async () => {
         const setPartialEval = (positionEval: PositionEval) => {
+          if (cancelled || isUiAnalysisLocked()) return;
           setCurrentPosition({ ...position, eval: positionEval });
         };
         const rawPositionEval = await getFenEngineEval(
@@ -125,7 +141,9 @@ export const useCurrentPosition = (engine: UciEngine | null) => {
           setPartialEval
         );
 
-        if (boardHistory.length === 0) return;
+        if (cancelled || isUiAnalysisLocked() || boardHistory.length === 0) {
+          return;
+        }
 
         const params = getEvaluateGameParams(board);
         const fens = params.fens.slice(board.turn() === "w" ? -3 : -4);
@@ -160,16 +178,17 @@ export const useCurrentPosition = (engine: UciEngine | null) => {
         });
       };
 
-      getPositionEval();
+      getPositionEval().catch(() => null);
     }
 
     return () => {
-      if (engine?.getIsReady()) {
+      cancelled = true;
+      if (engine?.getIsReady() && !isUiAnalysisLocked()) {
         engine?.stopAllCurrentJobs();
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gameEval, board, game, engine, depth, multiPv]);
+  }, [gameEval, board, game, engine, depth, multiPv, evaluationProgress]);
 
   return currentPosition;
 };
